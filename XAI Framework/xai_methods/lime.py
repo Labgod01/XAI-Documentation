@@ -1,8 +1,10 @@
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import json
 from pathlib import Path
 from lime.lime_tabular import LimeTabularExplainer
+from multi_output import class_suffix, to_json_value
 
 
 def run_lime(unified_payload, prepared_inputs, output_dir=None):
@@ -67,20 +69,19 @@ def run_lime(unified_payload, prepared_inputs, output_dir=None):
         mode=lime_mode,
         random_state=metadata["random_state"],
     )
-    label_idx = 1
-    if task_type == "classification":
-        pred = model.predict(pd.DataFrame(x_2d, columns=feature_names))[0]
-        target_class = metadata["class_to_explain"] if metadata["class_to_explain"] is not None else pred
-        label_idx = list(model.classes_).index(target_class)
-    # Generate instance explanation
+    # Classification: the classes chosen by class_to_explain (all classes by
+    # default). LIME explains label 1 unless told otherwise.
+    # Regression: one explanation (the label is ignored).
+    classes_to_explain = prepared_inputs["classes_to_explain"] or [(None, 1)]
+    label_indices = tuple(index for _, index in classes_to_explain)
+
+    # Generate instance explanation (one call for every explained class)
     exp_lime = lime_explainer.explain_instance(
         data_row=x_1d,
         predict_fn=predict_fn,
         num_features=min(5, len(feature_names)),
+        labels=label_indices,
     )
-
-    # Extract raw explanation weights
-    lime_weights = exp_lime.as_list()
 
     raw_pred = model.predict(
         pd.DataFrame(x_2d, columns=feature_names)
@@ -92,47 +93,55 @@ def run_lime(unified_payload, prepared_inputs, output_dir=None):
         else str(raw_pred)
     )
 
-    lime_llm_payload = {
-        "target": current_target,
-        "prediction": predicted_val,
-        "rules": {
-            rule: float(weight)
-            for rule, weight in lime_weights
-        },
-    }
+    for explained_class, label_idx in classes_to_explain:
+        suffix = class_suffix(explained_class, len(classes_to_explain))
+        title_class = f" (class {explained_class})" if explained_class is not None else ""
 
-    all_lime_explanations[current_target] = lime_llm_payload
+        # Extract raw explanation weights
+        lime_weights = exp_lime.as_list(label=label_idx)
 
-    # Save raw explanation values
-    if output_dir is not None:
-        raw_dir = Path(output_dir) / "raw_results"
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        lime_llm_payload = {
+            "target": current_target,
+            "prediction": predicted_val,
+            "explained_class": to_json_value(explained_class),
+            "rules": {
+                rule: float(weight)
+                for rule, weight in lime_weights
+            },
+        }
 
-        raw_file = raw_dir / f"lime_{current_target}.json"
-        with open(raw_file, "w", encoding="utf-8") as f:
-            json.dump(
-                lime_llm_payload,
-                f,
-                indent=4,
-                ensure_ascii=False
+        all_lime_explanations[f"{current_target}{suffix}"] = lime_llm_payload
+
+        # Save raw explanation values
+        if output_dir is not None:
+            raw_dir = Path(output_dir) / "raw_results"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+
+            raw_file = raw_dir / f"lime_{current_target}{suffix}.json"
+            with open(raw_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    lime_llm_payload,
+                    f,
+                    indent=4,
+                    ensure_ascii=False
+                )
+
+        print(f"\n--------------- LIME - Raw Values{title_class}: ---------------")
+        print(lime_llm_payload)
+
+        # Visualize local explanation
+        print(f"\n----------------- LIME - Plot{title_class}: -----------------")
+        fig = exp_lime.as_pyplot_figure(label=label_idx)
+        fig.suptitle(f"LIME Local Explanation - {current_target}{title_class}")
+        fig.tight_layout()
+
+        if output_dir is not None:
+            plot_dir = Path(output_dir) / "plots"
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            fig.savefig(
+                plot_dir / f"lime_local_{current_target}{suffix}.png",
+                bbox_inches="tight",
             )
-
-    print("\n--------------- LIME - Raw Values: ---------------")
-    print(lime_llm_payload)
-
-    # Visualize local explanation
-    print("\n----------------- LIME - Plot: -----------------")
-    fig = exp_lime.as_pyplot_figure()
-    fig.suptitle(f"LIME Local Explanation - {current_target}")
-    fig.tight_layout()
-
-    if output_dir is not None:
-        plot_dir = Path(output_dir) / "plots"
-        plot_dir.mkdir(parents=True, exist_ok=True)
-        fig.savefig(
-            plot_dir / f"lime_local_{current_target}.png",
-            bbox_inches="tight",
-        )
-    #plt.show()
+        plt.close(fig)
 
     return all_lime_explanations

@@ -83,8 +83,13 @@ def run_ale(unified_payload, prepared_inputs, output_dir=None, df=None):
             ale_explanations[current_target] = ale_exp
 
 
-            # Select features to visualize
-            features_to_plot = feature_names[:3]
+            # Select features to visualize: features_to_plot, else the first 3
+            configured_features = unified_payload["metadata"].get("features_to_plot")
+            if configured_features is not None:
+                features_to_plot = [f for f in configured_features if f in feature_names]
+            else:
+                features_to_plot = feature_names[:3]
+            print(f"ALE features: {features_to_plot}")
 
             # Store raw ALE values for each plotted feature
             ale_llm_payload = {

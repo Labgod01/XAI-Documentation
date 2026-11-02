@@ -1,18 +1,24 @@
 """
-Runs the XAI framework for the 4 basic cases and reports, per case and per
-method, whether it worked and which files it produced.
+Runs the XAI framework for the basic and the multi-output cases and reports,
+per case, target and method, whether it worked and which files it produced.
 
-    python test_cases.py                          # all methods, all 8 cases
-    python test_cases.py anchors                  # one method, all 8 cases
+    python test_cases.py                          # all methods, the 8 basic cases
+    python test_cases.py anchors                  # one method, the 8 basic cases
     python test_cases.py treeshap kernelshap      # several methods
     python test_cases.py anchors --case demo_regression custom_nn_classification
     python test_cases.py anchors --scope local
+    python test_cases.py --multi                  # all methods, the 7 multi-output cases
+    python test_cases.py --all                    # all methods, all 15 cases
 
 Method keys: lime treeshap kernelshap counterfactuals anchors ale pfi pdp ig
 
 Cases : sklearn model  -> demo / custom  x  classification / regression   (4 cases)
-        PyTorch NN     -> demo / custom  x  classification / regression   (4 cases, only IG can run:
-                          a bare nn.Module has no predict()/predict_proba() for the other methods)
+        PyTorch NN     -> demo / custom  x  classification / regression   (4 cases; the network is
+                          wrapped by torch_wrapper.py, so every method runs. TreeSHAP skips
+                          itself: it only explains tree models)
+        Multi-output   -> multi-class, multi-label, multi-output classification and
+                          multi-target regression, with sklearn and PyTorch (7 cases).
+                          Every method runs once per target column.
 Scope : "both" (local + global) - change SCOPE below to test "local" or "global"
 Output: outputs_test/<case>/{plots,raw_results}   (your normal outputs/ is untouched)
 """
@@ -28,13 +34,19 @@ import matplotlib
 matplotlib.use("Agg")  # no windows, save only
 import matplotlib.pyplot as plt
 import pandas as pd
-from sklearn.datasets import make_regression
-from sklearn.ensemble import RandomForestRegressor
+import torch
+import torch.nn as nn
+from sklearn.datasets import (make_classification, make_multilabel_classification,
+                              make_regression)
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.preprocessing import StandardScaler
 
 import config
 from data_loader import load_inputs
 from pipeline import build_unified_payload
 from framework_adapter import prepare_xai_inputs
+from multi_output import as_target_list
 
 SCOPE = "both"
 TEST_ROOT = Path(config.base_dir) / "outputs_test"
@@ -60,10 +72,17 @@ METHOD_KEYS = {
     "ig": "IntegratedGrad",
 }
 
-ALL_CASES = ["demo_regression", "demo_classification",
-             "demo_nn_regression", "demo_nn_classification",
-             "custom_regression", "custom_classification",
-             "custom_nn_regression", "custom_nn_classification"]
+BASIC_CASES = ["demo_regression", "demo_classification",
+               "demo_nn_regression", "demo_nn_classification",
+               "custom_regression", "custom_classification",
+               "custom_nn_regression", "custom_nn_classification"]
+
+MULTI_CASES = ["custom_multiclass", "custom_nn_multiclass",
+               "custom_multilabel", "custom_nn_multilabel",
+               "custom_multioutput_classification",
+               "custom_multitarget_regression", "custom_nn_multitarget_regression"]
+
+ALL_CASES = BASIC_CASES + MULTI_CASES
 
 
 def make_custom_regression_files(tmp_dir):
@@ -81,8 +100,107 @@ def make_custom_regression_files(tmp_dir):
     return csv_path, model_path
 
 
+def train_torch_net(X, Y, n_outputs, loss_fn, epochs=400):
+    """Small MLP trained on standardized features. Returns (net, scaler)."""
+    torch.manual_seed(config.random_state)
+    scaler = StandardScaler().fit(X)
+    xt = torch.tensor(scaler.transform(X), dtype=torch.float32)
+    net = nn.Sequential(nn.Linear(X.shape[1], 32), nn.ReLU(), nn.Linear(32, n_outputs))
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        loss = loss_fn(net(xt), Y)
+        loss.backward()
+        optimizer.step()
+    return net.eval(), scaler
+
+
+def save_and_load(df, model, targets, tmp_dir, name):
+    """Save the dataset and model to disk and load them back, like a user's own files."""
+    csv_path = Path(tmp_dir) / f"{name}.csv"
+    model_path = Path(tmp_dir) / f"{name}.joblib"
+    df.to_csv(csv_path, index=False)
+    joblib.dump(model, model_path)
+    target_col = targets[0] if len(targets) == 1 else targets
+    data, X, y, model = load_inputs(csv_path, model_path, target_col)
+    return model, data, target_col
+
+
+def build_multi_case(case, tmp_dir):
+    """Cases with 3+ classes or several target columns."""
+    rs = config.random_state
+    features = [f"f{i}" for i in range(5)]
+
+    if case in ("custom_multiclass", "custom_nn_multiclass"):
+        # One target column, 3 classes
+        X, y = make_classification(n_samples=300, n_features=5, n_informative=4,
+                                   n_redundant=0, n_classes=3, random_state=rs)
+        df = pd.DataFrame(X, columns=features)
+        df["species"] = y
+        targets = ["species"]
+        if case == "custom_multiclass":
+            model = RandomForestClassifier(n_estimators=50, random_state=rs)
+            model.fit(df[features], df["species"])
+        else:
+            net, scaler = train_torch_net(X, torch.tensor(y, dtype=torch.long), 3,
+                                          nn.CrossEntropyLoss())
+            model = {"model": net, "scaler": scaler}
+        return (*save_and_load(df, model, targets, tmp_dir, case), "classification")
+
+    if case in ("custom_multilabel", "custom_nn_multilabel"):
+        # Three 0/1 target columns
+        X, Y = make_multilabel_classification(n_samples=300, n_features=5, n_classes=3,
+                                              random_state=rs)
+        df = pd.DataFrame(X, columns=features)
+        targets = ["label_a", "label_b", "label_c"]
+        df[targets] = Y
+        if case == "custom_multilabel":
+            # Native multi-output forest: TreeSHAP skips it (see multi_output.py)
+            model = RandomForestClassifier(n_estimators=50, random_state=rs)
+            model.fit(df[features], df[targets])
+        else:
+            net, scaler = train_torch_net(X, torch.tensor(Y, dtype=torch.float32), 3,
+                                          nn.BCEWithLogitsLoss())
+            model = {"model": net, "scaler": scaler}
+        return (*save_and_load(df, model, targets, tmp_dir, case), "classification")
+
+    if case == "custom_multioutput_classification":
+        # One 0/1 target and one 3-class target, one forest per target
+        X, y = make_classification(n_samples=300, n_features=5, n_informative=4,
+                                   n_redundant=0, n_classes=3, random_state=rs)
+        df = pd.DataFrame(X, columns=features)
+        df["risk"] = y
+        df["flag"] = (X[:, 0] + X[:, 1] > 0).astype(int)
+        targets = ["flag", "risk"]
+        model = MultiOutputClassifier(RandomForestClassifier(n_estimators=50, random_state=rs))
+        model.fit(df[features], df[targets])
+        return (*save_and_load(df, model, targets, tmp_dir, case), "classification")
+
+    if case in ("custom_multitarget_regression", "custom_nn_multitarget_regression"):
+        # Several numeric target columns
+        n_targets = 3 if case == "custom_multitarget_regression" else 2
+        X, Y = make_regression(n_samples=300, n_features=5, n_informative=4,
+                               n_targets=n_targets, noise=10.0, random_state=rs)
+        df = pd.DataFrame(X, columns=features)
+        targets = [f"y{i + 1}" for i in range(n_targets)]
+        df[targets] = Y
+        if case == "custom_multitarget_regression":
+            model = RandomForestRegressor(n_estimators=50, random_state=rs)
+            model.fit(df[features], df[targets])
+        else:
+            net, scaler = train_torch_net(X, torch.tensor(Y, dtype=torch.float32),
+                                          n_targets, nn.MSELoss(), epochs=800)
+            model = {"model": net, "scaler": scaler}
+        return (*save_and_load(df, model, targets, tmp_dir, case), "regression")
+
+    raise ValueError(case)
+
+
 def build_case(case, tmp_dir):
     """Return (model, df, target_col, task_type) for the requested case."""
+    if case in MULTI_CASES:
+        return build_multi_case(case, tmp_dir)
+
     if case == "demo_classification":
         from demo_models import create_demo
         d = create_demo("classification", random_state=config.random_state)
@@ -96,7 +214,8 @@ def build_case(case, tmp_dir):
         return d["model"], df, d["target_col"], "regression"
 
     if case == "custom_classification":
-        data, X, y, model = load_inputs(config.data_path, config.model_path, "target")
+        data, X, y, model = load_inputs(Path(config.base_dir) / "data" / "my_dataset.csv",
+                                         Path(config.base_dir) / "models" / "my_model.joblib", "target")
         return model, data, "target", "classification"
 
     if case == "custom_regression":
@@ -109,10 +228,13 @@ def build_case(case, tmp_dir):
         task = case.split("_")[-1]
         d = create_demo("ig_nn", task, random_state=config.random_state)
         df = d["X"].copy(); df[d["target_col"]] = d["y"]
-        return d["model"], df, d["target_col"], task
+        # Same as main.py: the network travels with the scaler it was trained with
+        model = {"model": d["model"], "scaler": d["preprocessing"]}
+        return model, df, d["target_col"], task
 
     if case in ("custom_nn_classification", "custom_nn_regression"):
-        # Same NN as the demo, but saved to disk and loaded back like a user's own model
+        # Same NN as the demo, but saved to disk and loaded back like a user's own model.
+        # It is saved together with its scaler, as a dict.
         from demo_models import create_demo
         task = case.split("_")[-1]
         d = create_demo("ig_nn", task, random_state=config.random_state)
@@ -120,7 +242,7 @@ def build_case(case, tmp_dir):
         csv_path = Path(tmp_dir) / f"nn_{task}.csv"
         model_path = Path(tmp_dir) / f"nn_{task}.joblib"
         df.to_csv(csv_path, index=False)
-        joblib.dump(d["model"], model_path)
+        joblib.dump({"model": d["model"], "scaler": d["preprocessing"]}, model_path)
         data, X, y, model = load_inputs(csv_path, model_path, d["target_col"])
         return model, data, d["target_col"], task
 
@@ -137,27 +259,33 @@ def run_case(case, tmp_dir, selected):
     config.run_mode = "demo" if case.startswith("demo") else "custom"
 
     model, df, target_col, task_type = build_case(case, tmp_dir)
-    payload = build_unified_payload(
-        model=model, df=df, target_col=target_col, task_type=task_type,
-        scope=SCOPE, query_index=config.query_index,
-        class_names=config.class_names, class_to_explain=config.class_to_explain,
-        categorical_features_override=config.categorical_features_override,
-        immutable_features=config.immutable_features,
-        scoring_metric=config.scoring_metric,
-        features_to_plot=config.features_to_plot,
-        random_state=config.random_state, feature_metadata=config.feature_metadata,
-    )
-    prepared = prepare_xai_inputs(payload)
+    targets = as_target_list(target_col)
 
     rows = []
+    # Same as main.py: a model with several targets is explained one target at a time
+    for active_target in targets:
+        payload = build_unified_payload(
+            model=model, df=df, target_col=target_col, task_type=task_type,
+            scope=SCOPE, active_target=active_target, query_index=config.query_index,
+            class_names=config.class_names, class_to_explain=config.class_to_explain,
+            categorical_number_features=config.categorical_number_features,
+            immutable_features=config.immutable_features,
+            scoring_metric=config.scoring_metric,
+            features_to_plot=config.features_to_plot,
+            random_state=config.random_state, feature_metadata=config.feature_metadata,
+        )
+        prepared = prepare_xai_inputs(payload)
+        print(f"\n--- {payload['metadata']['problem_type']} | target: {active_target} ---")
+        label = f" [{active_target}]" if len(targets) > 1 else ""
+        rows += run_methods(out_dir, payload, prepared, df, selected, label)
+    return rows
+
+
+def run_methods(out_dir, payload, prepared, df, selected, label):
+    rows = []
     methods = [m for m in METHODS if m[0] in selected]
-    if "_nn_" in case:
-        # a bare nn.Module has no predict()/predict_proba(): only IG can run
-        skipped = [m[0] for m in methods if m[0] != "IntegratedGrad"]
-        methods = [m for m in methods if m[0] == "IntegratedGrad"]
-    else:
-        skipped = []
     for name, module, func, needs_df in methods:
+        name += label
         before = {p for p in out_dir.rglob("*") if p.is_file()}
         plt.close("all")  # each method starts with a clean matplotlib state
         try:
@@ -183,8 +311,6 @@ def run_case(case, tmp_dir, selected):
                 where += f"  <- called from {Path(proj[-1].filename).name}:{proj[-1].lineno}: {proj[-1].line}"
             rows.append((name, "ERROR", "", f"{type(exc).__name__}: {exc} @ {where}"))
             traceback.print_exc()
-    for name in skipped:
-        rows.append((name, "N/A", "", "nn.Module has no predict() - IG only"))
     return rows
 
 
@@ -194,6 +320,8 @@ def main():
     ap.add_argument("methods", nargs="*", help="method keys (default: all)")
     ap.add_argument("--case", nargs="*", default=None, choices=ALL_CASES)
     ap.add_argument("--scope", default=SCOPE, choices=["local", "global", "both"])
+    ap.add_argument("--multi", action="store_true", help="run the multi-output cases")
+    ap.add_argument("--all", action="store_true", help="run the basic and the multi-output cases")
     args = ap.parse_args()
     SCOPE = args.scope
 
@@ -202,7 +330,14 @@ def main():
         ap.error(f"unknown method(s) {unknown}. Choose from: {sorted(set(METHOD_KEYS))}")
     selected = ({METHOD_KEYS[m.lower()] for m in args.methods}
                 if args.methods else {m[0] for m in METHODS})
-    cases = args.case or ALL_CASES
+    if args.case:
+        cases = args.case
+    elif args.all:
+        cases = ALL_CASES
+    elif args.multi:
+        cases = MULTI_CASES
+    else:
+        cases = BASIC_CASES
 
     summary = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -218,7 +353,7 @@ def main():
     for case, rows in summary.items():
         print(f"\n[{case}]")
         for name, status, files, err in rows:
-            print(f"  {name:<16} {status:<26} {files:<18} {err}")
+            print(f"  {name:<28} {status:<26} {files:<18} {err}")
     print(f"\nFiles are in: {TEST_ROOT}")
 
 

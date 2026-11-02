@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import dice_ml
 import json
 from pathlib import Path
+from multi_output import class_suffix, to_json_value
 
 def run_counterfactuals(unified_payload, prepared_inputs, output_dir=None, df=None):
     """Generate Counterfactuals explanations for the active target."""
@@ -97,141 +98,166 @@ def run_counterfactuals(unified_payload, prepared_inputs, output_dir=None, df=No
             )
             exp_dice = dice_ml.Dice(d_dice, m_dice, method="random")
 
-            # 4. Prepare single query instance as DataFrame
-            query_instance = pd.DataFrame(x_2d, columns=feature_names)
+            # 4. Prepare single query instance as DataFrame, with the dataset's
+            # own column types: DiCE stores categories as text ("2"), and a
+            # float copy (2.0) would not match them
+            query_instance = unified_payload["query_instance"][feature_names].copy()
 
             # Extract current prediction
             raw_pred = active_model.predict(query_instance)[0]
             predicted_val = raw_pred.item() if isinstance(raw_pred, np.generic) else raw_pred       
 
             # 5. Configure counterfactual targets
+            # Immutable features (e.g. age) keep their value in every counterfactual
+            immutable = unified_payload["metadata"].get("immutable_features") or []
+            unknown = [f for f in immutable if f not in feature_names]
+            if unknown:
+                raise ValueError(
+                    f"immutable_features {unknown} are not features of the dataset."
+                )
+            features_to_vary = [f for f in feature_names if f not in immutable]
+            if not features_to_vary:
+                raise ValueError("immutable_features locks every feature: nothing can vary.")
+
             cf_kwargs = {
                 "query_instances": query_instance,
                 "total_CFs": 3,
-                "features_to_vary": "all",
+                "features_to_vary": features_to_vary if immutable else "all",
                 "random_seed": unified_payload["metadata"].get("random_state", 42),
             }
 
             if task_type == "classification":
-                classes = unified_payload["metadata"].get("class_names")
-
-                if classes is None:
-                    if not hasattr(model, "classes_"):
-                        raise ValueError(
-                            "Classification counterfactuals require class_names in metadata "
-                            "or a model with a classes_ attribute."
-                        )
-                    classes = list(model.classes_)
-
-                cf_kwargs["desired_class"] = (
-                    "opposite" if len(classes) == 2
-                    else next(cls for cls in classes if cls != raw_pred)
-                )
+                # Counterfactuals towards every explained class that differs from
+                # the prediction. When the only explained class is the prediction
+                # itself, towards every other class (binary: the opposite class).
+                model_classes = list(model.classes_)
+                wanted = [
+                    label for label, _ in prepared_inputs["classes_to_explain"]
+                    if label != raw_pred
+                ]
+                if not wanted:
+                    wanted = [label for label in model_classes if label != raw_pred]
+                desired_runs = [
+                    (
+                        label,
+                        # DiCE wants a plain int: the column of the class in predict_proba
+                        {"desired_class": "opposite"} if len(model_classes) == 2
+                        else {"desired_class": model_classes.index(label)},
+                    )
+                    for label in wanted
+                ]
             else:
                 predicted_value = float(predicted_val)
-                cf_kwargs["desired_range"] = sorted([
+                desired_runs = [(None, {"desired_range": sorted([
                     predicted_value * 1.05,
                     predicted_value * 1.50
-                ])
+                ])})]
 
-            # 6. Generate explanations and extract results
-            dice_exp = exp_dice.generate_counterfactuals(**cf_kwargs)
-            cf_examples = dice_exp.cf_examples_list
-            cf_df = (
-                cf_examples[0].final_cfs_df
-                if cf_examples and cf_examples[0] is not None
-                else None
-            )
+            for desired_label, desired_kwargs in desired_runs:
+                suffix = class_suffix(desired_label, len(desired_runs))
+                title_class = f" -> class {desired_label}" if desired_label is not None else ""
 
-            # 7. Build structured LLM payload with explicit feature deltas
-            orig_dict = query_instance.iloc[0].to_dict()
-            cf_llm_payload = {
-                "method": "DiCE_Counterfactuals",
-                "target": current_target,
-                "target_index": target_idx,
-                "predicted_value": predicted_val,
-                "desired_target": cf_kwargs.get("desired_class", cf_kwargs.get("desired_range")),
-                "counterfactuals": [],
-            }
+                # 6. Generate explanations and extract results
+                dice_exp = exp_dice.generate_counterfactuals(**cf_kwargs, **desired_kwargs)
+                cf_examples = dice_exp.cf_examples_list
+                cf_df = (
+                    cf_examples[0].final_cfs_df
+                    if cf_examples and cf_examples[0] is not None
+                    else None
+                )
 
-            if cf_df is not None and not cf_df.empty:
-                for idx, row in cf_df.iterrows():
-                    cf_row = row.to_dict()
-                    cf_target_val = cf_row.pop(current_target, None)
-                    modifications = {}
+                # 7. Build structured LLM payload with explicit feature deltas
+                orig_dict = query_instance.iloc[0].to_dict()
+                cf_llm_payload = {
+                    "method": "DiCE_Counterfactuals",
+                    "target": current_target,
+                    "target_index": target_idx,
+                    "predicted_value": predicted_val,
+                    "desired_target": (
+                        to_json_value(desired_label) if task_type == "classification"
+                        else desired_kwargs["desired_range"]
+                    ),
+                    "counterfactuals": [],
+                }
 
-                    for col, orig_val in orig_dict.items():
-                        new_val = cf_row.get(col)
-                        if isinstance(orig_val, (int, float, np.number)) and isinstance(new_val, (int, float, np.number)):
-                            if not np.isclose(orig_val, new_val, atol=1e-4):
-                                modifications[col] = {
-                                    "from": float(orig_val),
-                                    "to": float(new_val),
-                                    "delta": float(new_val - orig_val),
-                                }
-                        elif orig_val != new_val:
-                            modifications[col] = {"from": orig_val, "to": new_val}
+                if cf_df is not None and not cf_df.empty:
+                    for idx, row in cf_df.iterrows():
+                        cf_row = row.to_dict()
+                        cf_target_val = cf_row.pop(current_target, None)
+                        modifications = {}
 
-                    cf_llm_payload["counterfactuals"].append({
-                        "cf_index": idx + 1,
-                        "target_prediction": float(cf_target_val) if isinstance(cf_target_val, (int, float, np.number)) else str(cf_target_val),
-                        "modifications": modifications,
-                        "full_features": cf_row,
-                    })
+                        for col, orig_val in orig_dict.items():
+                            new_val = cf_row.get(col)
+                            if isinstance(orig_val, (int, float, np.number)) and isinstance(new_val, (int, float, np.number)):
+                                if not np.isclose(orig_val, new_val, atol=1e-4):
+                                    modifications[col] = {
+                                        "from": float(orig_val),
+                                        "to": float(new_val),
+                                        "delta": float(new_val - orig_val),
+                                    }
+                            elif orig_val != new_val:
+                                modifications[col] = {"from": orig_val, "to": new_val}
 
-            all_cf_explanations[current_target] = cf_llm_payload
+                        cf_llm_payload["counterfactuals"].append({
+                            "cf_index": idx + 1,
+                            "target_prediction": float(cf_target_val) if isinstance(cf_target_val, (int, float, np.number)) else str(cf_target_val),
+                            "modifications": modifications,
+                            "full_features": cf_row,
+                        })
 
-            # 8. Print raw values and visualize
-            print(f"\n--------------- Counterfactuals Payload ({current_target}) ---------------")
-            print(cf_llm_payload)
+                all_cf_explanations[f"{current_target}{suffix}"] = cf_llm_payload
 
-            with open(
-                raw_dir / f"counterfactuals_{current_target}.json",
-                "w",
-                encoding="utf-8"
-            ) as f:
-                json.dump(cf_llm_payload, f, indent=4, ensure_ascii=False)
+                # 8. Print raw values and visualize
+                print(f"\n--------------- Counterfactuals Payload ({current_target}{title_class}) ---------------")
+                print(cf_llm_payload)
 
-            print(f"\n----------------- Counterfactuals Plots ({current_target}) -----------------")
-            if cf_df is not None and not cf_df.empty:
+                with open(
+                    raw_dir / f"counterfactuals_{current_target}{suffix}.json",
+                    "w",
+                    encoding="utf-8"
+                ) as f:
+                    json.dump(cf_llm_payload, f, indent=4, ensure_ascii=False)
+
+                print(f"\n----------------- Counterfactuals Plots ({current_target}) -----------------")
+                if cf_df is not None and not cf_df.empty:
                 
-                # Bar plot of feature deltas for all counterfactuals
-                counterfactuals = cf_llm_payload["counterfactuals"]
+                    # Bar plot of feature deltas for all counterfactuals
+                    counterfactuals = cf_llm_payload["counterfactuals"]
 
-                plot_data = []
-                for cf in counterfactuals:
-                    for feature, modification in cf["modifications"].items():
-                        if "delta" in modification:
-                            plot_data.append({
-                                "label": f"CF {cf['cf_index']} - {feature}",
-                                "delta": modification["delta"],
-                            })
+                    plot_data = []
+                    for cf in counterfactuals:
+                        for feature, modification in cf["modifications"].items():
+                            if "delta" in modification:
+                                plot_data.append({
+                                    "label": f"CF {cf['cf_index']} - {feature}",
+                                    "delta": modification["delta"],
+                                })
 
-                if plot_data:
-                    labels = [item["label"] for item in plot_data]
-                    deltas = [item["delta"] for item in plot_data]
+                    if plot_data:
+                        labels = [item["label"] for item in plot_data]
+                        deltas = [item["delta"] for item in plot_data]
 
-                    fig_height = max(4, 0.6 * len(labels))
-                    plt.figure(figsize=(10, fig_height))
+                        fig_height = max(4, 0.6 * len(labels))
+                        plt.figure(figsize=(10, fig_height))
 
-                    y_pos = np.arange(len(labels))
-                    plt.barh(y_pos, deltas, color="#2b5c8f")
-                    plt.yticks(y_pos, labels)
-                    plt.axvline(0, color="black", linewidth=0.8)
-                    plt.xlabel("Delta (Counterfactual - Original)")
-                    plt.title(
-                        f"Counterfactual Feature Perturbations ({current_target})"
-                    )
-                    plt.gca().invert_yaxis()
-                    plt.tight_layout()
-                    plt.savefig(
-                        plots_dir / f"cf_deltas_{current_target}.png",
-                        dpi=300,
-                        bbox_inches="tight",
-                    )
-                    plt.close()
+                        y_pos = np.arange(len(labels))
+                        plt.barh(y_pos, deltas, color="#2b5c8f")
+                        plt.yticks(y_pos, labels)
+                        plt.axvline(0, color="black", linewidth=0.8)
+                        plt.xlabel("Delta (Counterfactual - Original)")
+                        plt.title(
+                            f"Counterfactual Feature Perturbations ({current_target}{title_class})"
+                        )
+                        plt.gca().invert_yaxis()
+                        plt.tight_layout()
+                        plt.savefig(
+                            plots_dir / f"cf_deltas_{current_target}{suffix}.png",
+                            dpi=300,
+                            bbox_inches="tight",
+                        )
+                        plt.close()
 
-                # Display formatted table of changes
-                dice_exp.visualize_as_dataframe(show_only_changes=True)
+                    # Display formatted table of changes
+                    dice_exp.visualize_as_dataframe(show_only_changes=True)
 
     return all_cf_explanations

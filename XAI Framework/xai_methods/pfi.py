@@ -76,8 +76,10 @@ def run_pfi(unified_payload, prepared_inputs, output_dir=None, df=None):
                 y=unified_payload["target"].values,
                 scoring=active_scoring,
                 n_repeats=10,
-                random_state=42,
-                n_jobs=-1
+                random_state=unified_payload["metadata"]["random_state"],
+                # torch already uses several threads; separate worker processes
+                # would each have to load torch and copy the network
+                n_jobs=1 if getattr(model, "is_torch_wrapper", False) else -1
             )
 
             # Store explanation object in dictionary

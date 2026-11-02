@@ -4,6 +4,33 @@ import matplotlib.pyplot as plt
 import json
 from pathlib import Path
 from sklearn.inspection import PartialDependenceDisplay
+from sklearn.base import BaseEstimator, ClassifierMixin
+from multi_output import class_suffix, to_json_value
+
+
+class _SwappedBinaryClassifier(ClassifierMixin, BaseEstimator):
+    """
+    A binary classifier with its two classes swapped. sklearn's PDP/ICE always
+    plot the probability of classes_[1]; this lets them plot classes_[0].
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.classes_ = np.asarray(model.classes_)[::-1]
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def predict_proba(self, X):
+        return np.asarray(self.model.predict_proba(X))[:, ::-1]
+
+    def __sklearn_is_fitted__(self):
+        return True
+
+    def fit(self, X=None, y=None):
+        # sklearn checks that a fit method exists; the model is already trained
+        raise NotImplementedError("Wraps an already trained model.")
+
 
 def run_pdp_ice(unified_payload, prepared_inputs, output_dir=None, df=None):
     """Generate PDP/ICE explanations for the active target."""
@@ -92,165 +119,155 @@ def run_pdp_ice(unified_payload, prepared_inputs, output_dir=None, df=None):
             print(f"Task type: {task_type}")
             print(f"Selected features: {selected_features}")
 
-            # 2. Define parameters according to task type
+            # 2. Classes to explain: one PDP/ICE per class (classification),
+            # one for regression. sklearn needs target= for 3+ classes and
+            # always plots classes_[1] for 2 classes.
             X_pdp = reference_dataset.astype(float)
-            pdp_parameters = {
-                "estimator": model,
-                "X": X_pdp,
-                "features": selected_features,
-                "grid_resolution": 20,
-                "subsample": 50,
-                "random_state": unified_payload["metadata"]["random_state"]
-            }
-
-            if task_type == "classification":
-                pdp_parameters["response_method"] = "predict_proba"
-            elif task_type == "regression":
-                # For regression, sklearn uses predict()
-                # No response_method is required.
-                pass
-            else:
-                raise ValueError(
-                    f"Unsupported task type: {task_type}"
-                )
-
-            pdp_display = None
-            ice_display = None
-            
-            # 3. Partial Dependence Plot (PDP)
-            if run_pdp:
-                print("\nComputing Partial Dependence plots...")
-
-                pdp_display = PartialDependenceDisplay.from_estimator(
-                    **pdp_parameters,
-                    kind="average"
-                )
-                pdp_display.figure_.suptitle(
-                    "Partial Dependence Plots (PDP)",
-                    fontsize=16
-                )
-                plt.tight_layout()
-                plt.savefig(plots_dir / f"pdp_{current_target}.png", dpi=300)
-                #plt.show()
-
-            # Use the two most important features for ICE
-            # to keep the visualization readable.
-            ice_features = selected_features[:2]
-
-            # 4. Individual Conditional Expectation (ICE) - local
-            if run_ice:
-                print("\nComputing ICE plots...")
-
-                # Use the two most important features for ICE
-                # to keep the visualization readable.
-
-                ice_features = selected_features[:2]
-
-                ice_parameters = {
-                    "estimator": model,
-                    "X": X_pdp,
-                    "features": ice_features,
-                    "kind": "individual",
-                    "centered": False,
-                    "grid_resolution": 20,
-                    "subsample": 50,
-                    "random_state": unified_payload["metadata"]["random_state"]
-                }
-
-                if task_type == "classification":
-                    ice_parameters["response_method"] = "predict_proba"
-                elif task_type == "regression":
-                    # Regression uses model.predict()
-                    pass
-                ice_display = PartialDependenceDisplay.from_estimator(
-                    **ice_parameters
-                )
-                ice_display.figure_.suptitle(
-                    "Individual Conditional Expectation (ICE)",
-                    fontsize=16
-                )
-                plt.tight_layout()
-                plt.savefig(plots_dir / f"ice_{current_target}.png", dpi=300)
-                #plt.show()
-
-            # 5. Store explanations and extract raw values
-
-            pdp_ice_explanations[current_target] = {
-                "selected_features": selected_features,
-                "ice_features": ice_features,
-                "pdp_display": pdp_display,
-                "ice_display": ice_display,
-                "task_type": task_type
-            }
-
-            # Extract raw PDP and ICE data from sklearn displays
-            pdp_raw = {}
-            ice_raw = {}
-
+            classes_to_explain = prepared_inputs["classes_to_explain"] or [(None, None)]
             classes = (
                 model.classes_.tolist()
                 if task_type == "classification"
                 and hasattr(model, "classes_")
                 else None
             )
+            ice_features = selected_features[:2]
 
-            if run_pdp:
-                for i, feature in enumerate(selected_features):
-                    pdp_raw[feature] = {
-                        "grid_values": [
-                            float(v) for v in
-                            pdp_display.pd_results[i]["grid_values"][0]
-                        ],
-                        "average_predictions": [
-                            np.asarray(v).tolist()
-                            for v in pdp_display.pd_results[i]["average"]
-                        ]
-                    }
+            for explained_class, class_idx in classes_to_explain:
+                suffix = class_suffix(explained_class, len(classes_to_explain))
+                title_class = f" - class {explained_class}" if explained_class is not None else ""
 
-            if run_ice:
-                for i, feature in enumerate(ice_features):
-                    ice_raw[feature] = {
-                        "grid_values": [
-                            float(v) for v in
-                            ice_display.pd_results[i]["grid_values"][0]
-                        ],
-                        "individual_predictions": np.asarray(
-                            ice_display.pd_results[i]["individual"]
-                        ).tolist()
-                    }
+                estimator = model
+                common_parameters = {
+                    "grid_resolution": 20,
+                    "subsample": 50,
+                    "random_state": unified_payload["metadata"]["random_state"]
+                }
+                if task_type == "classification":
+                    common_parameters["response_method"] = "predict_proba"
+                    if len(model.classes_) > 2:
+                        common_parameters["target"] = explained_class
+                    elif class_idx == 0:
+                        # Binary: plot the first class by swapping the two classes
+                        estimator = _SwappedBinaryClassifier(model)
+                    print(f"Explained class: {explained_class}")
 
-            pdp_ice_raw_values[current_target] = {
-                "method": "PDP_ICE",
-                "target": str(current_target),
-                "task_type": task_type,
-                "classes": classes,
-                "pdp": pdp_raw,
-                "ice": ice_raw
-            }
+                pdp_display = None
+                ice_display = None
 
-            print("\n--- PDP / ICE Raw Values Summary ---")
-            print("Target:", current_target)
-            print("Task type:", task_type)
-            print("PDP features:", list(pdp_raw.keys()))
-            print("ICE features:", list(ice_raw.keys()))
+                # 3. Partial Dependence Plot (PDP) - global
+                if run_pdp:
+                    print("\nComputing Partial Dependence plots...")
 
-            with open(
-                raw_dir / f"pdp_ice_{current_target}.json",
-                "w",
-                encoding="utf-8"
-            ) as f:
-                json.dump(pdp_ice_raw_values[current_target], f, indent=4, ensure_ascii=False)
+                    pdp_display = PartialDependenceDisplay.from_estimator(
+                        estimator=estimator,
+                        X=X_pdp,
+                        features=selected_features,
+                        kind="average",
+                        **common_parameters
+                    )
+                    pdp_display.figure_.suptitle(
+                        f"Partial Dependence Plots (PDP){title_class}",
+                        fontsize=16
+                    )
+                    plt.tight_layout()
+                    plt.savefig(plots_dir / f"pdp_{current_target}{suffix}.png", dpi=300)
+                    plt.close("all")
 
-            for feature, values in pdp_raw.items():
-                print(
-                    f"PDP {feature}: "
-                    f"{len(values['grid_values'])} grid points"
-                )
-            for feature, values in ice_raw.items():
-                print(
-                    f"ICE {feature}: "
-                    f"{len(values['grid_values'])} grid points, "
-                    f"{len(values['individual_predictions'])} individual curves"
-                )
+                # 4. Individual Conditional Expectation (ICE) - local
+                # Only the two most important features, to keep the plot readable
+                if run_ice:
+                    print("\nComputing ICE plots...")
+
+                    ice_display = PartialDependenceDisplay.from_estimator(
+                        estimator=estimator,
+                        X=X_pdp,
+                        features=ice_features,
+                        kind="individual",
+                        centered=False,
+                        **common_parameters
+                    )
+                    ice_display.figure_.suptitle(
+                        f"Individual Conditional Expectation (ICE){title_class}",
+                        fontsize=16
+                    )
+                    plt.tight_layout()
+                    plt.savefig(plots_dir / f"ice_{current_target}{suffix}.png", dpi=300)
+                    plt.close("all")
+
+                # 5. Store explanations and extract raw values
+                pdp_ice_explanations[f"{current_target}{suffix}"] = {
+                    "selected_features": selected_features,
+                    "ice_features": ice_features,
+                    "pdp_display": pdp_display,
+                    "ice_display": ice_display,
+                    "task_type": task_type
+                }
+
+                # Extract raw PDP and ICE data from sklearn displays
+                pdp_raw = {}
+                ice_raw = {}
+
+                if run_pdp:
+                    for i, feature in enumerate(selected_features):
+                        pdp_raw[feature] = {
+                            "grid_values": [
+                                float(v) for v in
+                                pdp_display.pd_results[i]["grid_values"][0]
+                            ],
+                            "average_predictions": [
+                                np.asarray(v).tolist()
+                                for v in pdp_display.pd_results[i]["average"]
+                            ]
+                        }
+
+                if run_ice:
+                    for i, feature in enumerate(ice_features):
+                        ice_raw[feature] = {
+                            "grid_values": [
+                                float(v) for v in
+                                ice_display.pd_results[i]["grid_values"][0]
+                            ],
+                            "individual_predictions": np.asarray(
+                                ice_display.pd_results[i]["individual"]
+                            ).tolist()
+                        }
+
+                pdp_ice_raw_values[f"{current_target}{suffix}"] = {
+                    "method": "PDP_ICE",
+                    "target": str(current_target),
+                    "task_type": task_type,
+                    "classes": classes,
+                    "explained_class": to_json_value(explained_class),
+                    "pdp": pdp_raw,
+                    "ice": ice_raw
+                }
+
+                print("\n--- PDP / ICE Raw Values Summary ---")
+                print("Target:", current_target)
+                print("Task type:", task_type)
+                print("PDP features:", list(pdp_raw.keys()))
+                print("ICE features:", list(ice_raw.keys()))
+
+                with open(
+                    raw_dir / f"pdp_ice_{current_target}{suffix}.json",
+                    "w",
+                    encoding="utf-8"
+                ) as f:
+                    json.dump(
+                        pdp_ice_raw_values[f"{current_target}{suffix}"],
+                        f, indent=4, ensure_ascii=False
+                    )
+
+                for feature, values in pdp_raw.items():
+                    print(
+                        f"PDP {feature}: "
+                        f"{len(values['grid_values'])} grid points"
+                    )
+                for feature, values in ice_raw.items():
+                    print(
+                        f"ICE {feature}: "
+                        f"{len(values['grid_values'])} grid points, "
+                        f"{len(values['individual_predictions'])} individual curves"
+                    )
             print("\n[OK] PDP / ICE explanation completed.")
     return pdp_ice_explanations

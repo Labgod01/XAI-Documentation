@@ -2,6 +2,7 @@ from pathlib import Path
 import joblib
 import pandas as pd
 import torch
+from torch_wrapper import unpack_torch_bundle
 
 def load_dataset(dataset_path, target_col):
     """Load a CSV dataset and separate features (X) from target(s) (y)."""
@@ -63,13 +64,30 @@ def load_model(model_path):
         )
 
     try:
-        model = joblib.load(model_path)
+        if model_path.suffix.lower() in (".pt", ".pth"):
+            # Whole network saved with torch.save(model, path)
+            model = torch.load(model_path, weights_only=False, map_location="cpu")
+        else:
+            model = joblib.load(model_path)
     except Exception as exc:
         raise RuntimeError(
             f"Could not load model from '{model_path}'."
         ) from exc
 
-    if not (hasattr(model, "predict") or isinstance(model, torch.nn.Module)):
+    # A state_dict holds only the weights, not the network itself
+    if isinstance(model, dict) and "model" not in model:
+        raise TypeError(
+            "The file contains a dictionary without a 'model' key (a state_dict?). "
+            "Save the whole network, or a dict {'model': net, 'scaler': scaler}."
+        )
+
+    # A PyTorch network may be saved alone, as (net, scaler) or as a dict
+    # with a 'model' key. It is wrapped later, in framework_adapter.py.
+    net, torch_options = unpack_torch_bundle(model)
+    if torch_options is not None:
+        return model
+
+    if not hasattr(model, "predict"):
         raise TypeError(
             "The loaded model must provide a predict() method or be a torch.nn.Module."
         )

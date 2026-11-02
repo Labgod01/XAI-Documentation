@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import json
 import shap
 from pathlib import Path
+from multi_output import class_suffix, shap_for_class, to_json_value
 
 def run_kernel_shap(unified_payload, prepared_inputs, output_dir=None):
     """Generate KernelSHAP explanations for the active target."""
@@ -61,249 +62,173 @@ def run_kernel_shap(unified_payload, prepared_inputs, output_dir=None):
         background_data
     )
     
+    # Classes to explain (classification); regression has one output
+    classes_to_explain = prepared_inputs["classes_to_explain"] or [(None, None)]
+    x_df = pd.DataFrame(x_2d, columns=feature_names)
+
     if scope in ("local", "both"):
 
-    
         # Compute KernelSHAP Explanation for a single instance
-        local_kernel_shap_values = kernel_explainer(x_2d)
-        print(
-            f"Local KernelSHAP values shape: "
-            f"{local_kernel_shap_values.values.shape}"
-        )
-        # Container to collect SHAP values across targets for downstream LLM ingestion
-        local_kernel_shap_llm_payload = {}
+        local_values = kernel_explainer(x_2d)
+        print(f"Local KernelSHAP values shape: {local_values.values.shape}")
 
-        # print(f"\n================= KernelSHAP Local - Target: {current_target} =================")
-        print(f"\n================= KernelSHAP Local =================")
+        print("\n================= KernelSHAP Local =================")
 
-        # ------------------------- Raw Values Extraction -------------------------
+        for explained_class, class_idx in classes_to_explain:
+            suffix = class_suffix(explained_class, len(classes_to_explain))
+            title_class = f" (class {explained_class})" if explained_class is not None else ""
 
-        # Select SHAP values for the query instance and correct output
-        local_values_shape = local_kernel_shap_values.values.shape
-        
-        if len(local_values_shape) == 3:
-            if task_type == "classification":
-                # predicted_class = model.predict(x_2d)[0]
-                predicted_class = model.predict(
-                    pd.DataFrame(x_2d, columns=feature_names)
-                )[0]
-                class_idx = list(model.classes_).index(predicted_class)
-                exp_instance = local_kernel_shap_values[0, :, class_idx]
-            else:
-                # Multi-output regression: retain target-specific selection
-                # exp_instance = local_kernel_shap_values[0, :, target_idx]
-                 raise NotImplementedError(
-                    "Multi-output regression requires explicit output selection."
-                )
-        else:
-            # Single-output regression or binary SHAP explanation
-            exp_instance = local_kernel_shap_values[0]
+            # ------------------------- Raw Values Extraction -------------------------
 
-        shap_vals = exp_instance.values
-        base_val = float(exp_instance.base_values)
+            # SHAP values of the query instance for this class
+            exp_instance = shap_for_class(local_values, class_idx)[0]
 
-        # Map each feature to its corresponding SHAP value
-        feature_contributions = [
-            {"feature": feat, "shap_value": float(val)}
-            for feat, val in zip(feature_names, shap_vals)
-        ]
-        # Sort features by absolute contribution impact
-        feature_contributions.sort(key=lambda x: abs(x["shap_value"]), reverse=True)
+            shap_vals = exp_instance.values
+            base_val = float(exp_instance.base_values)
 
-        # Check
+            # Map each feature to its corresponding SHAP value, sorted by impact
+            feature_contributions = [
+                {"feature": feat, "shap_value": float(val)}
+                for feat, val in zip(feature_names, shap_vals)
+            ]
+            feature_contributions.sort(key=lambda x: abs(x["shap_value"]), reverse=True)
 
-        x_df = pd.DataFrame(x_2d, columns=feature_names)
+            local_llm_payload = {
+                current_target: {
+                    "method": "KernelSHAP",
+                    "target": current_target,
+                    "explained_class": to_json_value(explained_class),
+                    "base_value": base_val,
+                    "prediction": float(
+                        model.predict_proba(x_df)[0][class_idx]
+                    ) if task_type == "classification" else float(
+                        model.predict(x_df)[0]
+                    ),
+                    "feature_contributions": feature_contributions
+                }
+            }
+            all_kernel_shap_explanations.setdefault("local", {})[f"{current_target}{suffix}"] = (
+                local_llm_payload[current_target]
+            )
 
-        if task_type == "classification":
-            predicted_class = model.predict(x_df)[0]
-            predicted_proba = model.predict_proba(x_df)[0]
-        else:
-            prediction = float(model.predict(x_df)[0])
+            # ------------------------- KernelSHAP Local Output -------------------------
+            print(f"\n--------------- Local KernelSHAP - Raw Values{title_class}: ---------------")
+            print(local_llm_payload[current_target])
 
-        local_kernel_shap_llm_payload[current_target] = {
-            "method": "KernelSHAP",
-            "target": current_target,
-            "base_value": base_val,
-            "prediction": float(
-                model.predict_proba(
-                    pd.DataFrame(x_2d, columns=feature_names))[0][class_idx]
-            ) if task_type == "classification" else float(
-                model.predict(pd.DataFrame(x_2d, columns=feature_names)
-                )[0]
-            ),
-            "feature_contributions": feature_contributions
-        }
-        all_kernel_shap_explanations["local"] = local_kernel_shap_llm_payload
+            with open(
+                raw_dir / f"kernel_shap_local_{current_target}{suffix}.json",
+                "w",
+                encoding="utf-8"
+            ) as f:
+                json.dump(local_llm_payload, f, indent=4, ensure_ascii=False)
 
-        # ------------------------- KernelSHAP Local Output -------------------------
-        print("\n--------------- Local KernelSHAP - Raw Values: ---------------")
-        print(local_kernel_shap_llm_payload[current_target])
+            print(f"\n--------------- Local KernelSHAP - Plots{title_class} ---------------")
 
-        with open(
-            raw_dir / f"kernel_shap_local_{current_target}.json",
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(local_kernel_shap_llm_payload, f, indent=4, ensure_ascii=False)
+            # Waterfall Plot
+            plt.figure()
+            shap.plots.waterfall(exp_instance, show=False)
+            plt.title(f"KernelSHAP Waterfall Plot - Target: {current_target}{title_class}")
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"kernel_shap_local_waterfall_{current_target}{suffix}.png",
+                        dpi=300, bbox_inches="tight")
+            plt.close()
 
-        # print("\n--------------- Local KernelSHAP - Plots ({current_target}): ---------------")
-        print("\n--------------- Local KernelSHAP - Plots ---------------")
-
-        # Waterfall Plot
-        plt.figure()
-        shap.plots.waterfall(exp_instance, show=False)
-        plt.title(f"Local KernelSHAP Waterfall Plot - Target: {current_target}")
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"kernel_shap_local_waterfall_{current_target}.png",
-                            dpi=300, bbox_inches="tight")
-        #plt.show()
-
-        # Force Plot (Rendered via Matplotlib for inline display)
-        shap.plots.force(
-            base_value=exp_instance.base_values,
-            shap_values=exp_instance.values,
-            features=exp_instance.data,
-            feature_names=feature_names,
-            matplotlib=True,
-            show=False
-        )
-        plt.title(f"Local KernelSHAP Force Plot - Target: {current_target}")
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"kernel_shap_local_force_{current_target}.png",
-                                    dpi=300, bbox_inches="tight")
-        #plt.show()
+            # Force Plot (rendered via Matplotlib)
+            shap.plots.force(
+                base_value=exp_instance.base_values,
+                shap_values=exp_instance.values,
+                features=exp_instance.data,
+                feature_names=feature_names,
+                matplotlib=True,
+                show=False
+            )
+            plt.title(f"Local KernelSHAP Force Plot - Target: {current_target}{title_class}")
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"kernel_shap_local_force_{current_target}{suffix}.png",
+                        dpi=300, bbox_inches="tight")
+            plt.close("all")
 
     if scope in ("global", "both"):
 
-        # print(f"\n================= KernelSHAP Global - Target: {current_target} =================")
-        print(f"\n================= KernelSHAP Global =================")
+        print("\n================= KernelSHAP Global =================")
 
-        # Compute KernelSHAP Explanation across the entire reference dataset (or sample)
-        global_kernel_shap_values = kernel_explainer(reference_dataset)
-        print(f"Global KernelSHAP values shape: {global_kernel_shap_values.values.shape}")
+        # Compute KernelSHAP Explanation across the entire reference dataset
+        global_values = kernel_explainer(reference_dataset)
+        print(f"Global KernelSHAP values shape: {global_values.values.shape}")
 
-        # --------- MULTI-TARGET ---------------------------
+        for explained_class, class_idx in classes_to_explain:
+            suffix = class_suffix(explained_class, len(classes_to_explain))
+            current_label = str(explained_class) if explained_class is not None else current_target
 
-        # # Resolve dynamic output labels (classes for classification, targets for regression)
-        # if task_type == "classification":
-        #     # Extract class names from metadata or fallback to numeric class indices
-        #     output_labels = unified_payload["metadata"].get("class_names")
-        #     if output_labels is None:
-        #         n_classes = global_kernel_shap_values.values.shape[-1] if len(global_kernel_shap_values.values.shape) == 3 else 2
-        #         output_labels = [f"Class_{i}" for i in range(n_classes)]
-        # else:
-        #     # Regression: target names (handles both single target string and list of targets)
-        #     output_labels = targets if isinstance(targets, list) else [targets]
+            exp_global = shap_for_class(global_values, class_idx)
 
-        # # Slice Explanation object safely for current output
-        # if len(global_kernel_shap_values.values.shape) == 3:
-        #     # 3D Array: (n_samples, n_features, n_classes/targets) -> Slice to 2D
-        #     exp_global = global_kernel_shap_values[:, :, out_idx]
-        # else:
-        #     # 2D Array: Single-target regression
-        #     exp_global = global_kernel_shap_values
+            # ------------------------- Raw Values Extraction -------------------------
 
-        # Container to collect global SHAP feature importances for downstream LLM
-        global_kernel_shap_llm_payload = {}    
+            # Global feature importance (mean |SHAP|) for the LLM
+            mean_abs_shap = np.mean(np.abs(exp_global.values), axis=0)
+            global_contributions = [
+                {"feature": feat, "mean_abs_shap": float(val)}
+                for feat, val in zip(feature_names, mean_abs_shap)
+            ]
+            global_contributions.sort(key=lambda x: x["mean_abs_shap"], reverse=True)
 
-        # ----------- SINGLE-TARGET ----------------------
+            global_llm_payload = {
+                current_label: {
+                    "method": "KernelSHAP_Global",
+                    "target": current_target,
+                    "explained_class": to_json_value(explained_class),
+                    "output_label": current_label,
+                    "feature_importance": global_contributions
+                }
+            }
+            all_kernel_shap_explanations.setdefault("global", {})[f"{current_target}{suffix}"] = (
+                global_llm_payload[current_label]
+            )
 
-        # Resolve the output to explain
-        global_values_shape = global_kernel_shap_values.values.shape
+            print(f"\n--------------- Global KernelSHAP - Raw Values (output: {current_label}): ---------------")
+            print(global_llm_payload[current_label])
 
-        if len(global_values_shape) == 3:
-            if task_type == "classification":
-                # predicted_class = model.predict(x_2d)[0]
-                predicted_class = model.predict(
-                    pd.DataFrame(x_2d, columns=feature_names)
-                )[0]
-                out_idx = list(model.classes_).index(predicted_class)
-                current_label = str(predicted_class)
-            else:
-                raise NotImplementedError(
-                    "Multi-output regression is not supported yet."
-                )
+            with open(
+                raw_dir / f"kernel_shap_global_{current_target}{suffix}.json",
+                "w",
+                encoding="utf-8"
+            ) as f:
+                json.dump(global_llm_payload, f, indent=4, ensure_ascii=False)
 
-            exp_global = global_kernel_shap_values[:, :, out_idx]
+            # ------------------------- KernelSHAP Global Output -------------------------
+            print(f"\n--------------- Global KernelSHAP - Plots (output: {current_label}): ---------------")
 
-        else:
-            exp_global = global_kernel_shap_values
+            # Beeswarm / Summary Plot
+            plt.figure()
+            shap.plots.beeswarm(exp_global, show=False)
+            plt.title(f"Global KernelSHAP Beeswarm Plot - Output: {current_label}", pad=15)
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"kernel_shap_global_beeswarm_{current_target}{suffix}.png",
+                        dpi=300, bbox_inches="tight")
+            plt.close("all")
 
-            if task_type == "classification":
-                # predicted_class = model.predict(x_2d)[0]
-                predicted_class = model.predict(
-                    pd.DataFrame(x_2d, columns=feature_names)
-                )[0]
-                current_label = str(predicted_class)
-            else:
-                current_label = current_target
+            # Global Feature Importance Bar Plot
+            plt.figure()
+            shap.plots.bar(exp_global, show=False)
+            plt.title(f"Global KernelSHAP Bar Plot - Output: {current_label}", pad=15)
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"kernel_shap_global_bar_{current_target}{suffix}.png",
+                        dpi=300, bbox_inches="tight")
+            plt.close("all")
 
-        # ------------------------- KernelSHAP Raw Values Extraction -------------------------
-
-        # KernelSHAP Global Feature Importance extraction for LLM
-        mean_abs_shap = np.mean(np.abs(exp_global.values), axis=0)
-        global_contributions = [
-            {"feature": feat, "mean_abs_shap": float(val)}
-            for feat, val in zip(feature_names, mean_abs_shap)
-        ]
-        global_contributions.sort(key=lambda x: x["mean_abs_shap"], reverse=True)
-
-        global_kernel_shap_llm_payload[current_label] = {
-            "method": "KernelSHAP_Global",
-            "output_label": current_label,
-            "feature_importance": global_contributions
-        }
-
-        all_kernel_shap_explanations["global"] = global_kernel_shap_llm_payload
-
-        print("\n--------------- Global KernelSHAP - Raw Values: ---------------")
-        print(global_kernel_shap_llm_payload[current_label])
-
-        with open(
-            raw_dir / f"kernel_shap_global_{current_target}.json",
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(global_kernel_shap_llm_payload, f, indent=4, ensure_ascii=False)
-
-        # ------------------------- KernelSHAP Gloabl Output -------------------------
-        # print(f"\n--------------- Global KernelSHAP - Plots ({current_target}): ---------------")
-        print(f"\n--------------- Global KernelSHAP - Plots: ---------------")
-
-        # KernelSHAP Beeswarm / Summary Plot
-        plt.figure()
-        shap.plots.beeswarm(exp_global, show=False)
-        # plt.title(f"Global KernelSHAP Beeswarm Plot - Target: {current_target}", pad=15)
-        plt.title(f"Global KernelSHAP Beeswarm Plot - Output: {current_label}", pad=15)
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"kernel_shap_global_beeswarm_{current_target}.png",
-                    dpi=300, bbox_inches="tight")
-        #plt.show()
-
-        # KernelSHAP Global Feature Importance Bar Plot
-        plt.figure()
-        shap.plots.bar(exp_global, show=False)
-        # plt.title(f"Global KernelSHAP Global Bar Plot - Target: {current_target}", pad=15)
-        plt.title(f"Global KernelSHAP Bar Plot - Output: {current_label}", pad=15)
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"kernel_shap_global_bar_{current_target}.png",
-                            dpi=300, bbox_inches="tight")
-        #plt.show()
-
-        # KernelSHAP Global Dynamic Dependence Plot (Top Feature)
-        top_feature = global_contributions[0]["feature"]
-        plt.figure()
-        shap.plots.scatter(
-            exp_global[:, top_feature],   # Strictly 1D slice
-            color=exp_global,             # 2D slice for interaction color
-            show=False
-        )
-        # plt.title(f"Global KernelSHAP Dependence: {top_feature} (Output: {current_label})", pad=15)
-        plt.title(f"Global KernelSHAP Dependence: {top_feature} (Output: {current_label})", pad=15)
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"kernel_shap_global_dependence_{current_target}.png",
-                            dpi=300, bbox_inches="tight")
-        #plt.show()
+            # Dependence Plot of the top feature
+            top_feature = global_contributions[0]["feature"]
+            plt.figure()
+            shap.plots.scatter(
+                exp_global[:, top_feature],   # Strictly 1D slice
+                color=exp_global,             # 2D slice for interaction color
+                show=False
+            )
+            plt.title(f"Global KernelSHAP Dependence: {top_feature} (Output: {current_label})", pad=15)
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"kernel_shap_global_dependence_{current_target}{suffix}.png",
+                        dpi=300, bbox_inches="tight")
+            plt.close("all")
 
     return all_kernel_shap_explanations
 

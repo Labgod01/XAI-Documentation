@@ -58,21 +58,37 @@ def run_anchors(unified_payload, prepared_inputs, output_dir=None, df=None):
 
         if unified_payload["scope"] in ["local", "both"]:
 
-            # Determine prediction function and mode dynamically based on task type
-            if task_type == "classification":
-                # Wrapper to retain feature names
-                predict_fn = lambda x: model.predict(pd.DataFrame(x, columns=feature_names))
-            else:
+            if task_type != "classification":
                 print("Skipping Anchors: supported only for classification.")
                 continue
 
-            # Map categorical column names to integer indices for AnchorTabularExplainer
+            # The anchor library wants every categorical feature as positions
+            # 0..k-1 in a list of names. Category values (e.g. country = 1/2/3)
+            # are turned into positions for the library and back for the model.
             cat_cols = unified_payload["metadata"].get("categorical_features", [])
             cat_indices = [feature_names.index(col) for col in cat_cols if col in feature_names]
+            categories = {idx: np.unique(X_np[:, idx]) for idx in cat_indices}
+            categorical_names = {
+                idx: [f"{v:g}" if isinstance(v, (int, float, np.number)) else str(v)
+                      for v in values]
+                for idx, values in categories.items()
+            }
 
-            categorical_names = (
-                {idx: list(np.unique(X_np[:, idx])) for idx in cat_indices}
-                if cat_indices else {}
+            def to_positions(X):
+                X = np.array(X, dtype=object if X_np.dtype == object else float, copy=True)
+                for idx, values in categories.items():
+                    X[:, idx] = np.searchsorted(values, X[:, idx])
+                return X
+
+            def to_values(X):
+                X = np.array(X, dtype=object if X_np.dtype == object else float, copy=True)
+                for idx, values in categories.items():
+                    X[:, idx] = values[X[:, idx].astype(int)]
+                return X
+
+            # Wrapper to retain feature names
+            predict_fn = lambda x: model.predict(
+                pd.DataFrame(to_values(x), columns=feature_names)
             )
 
             class_names = unified_payload["metadata"].get("class_names")
@@ -88,7 +104,7 @@ def run_anchors(unified_payload, prepared_inputs, output_dir=None, df=None):
             explainer = anchor_tabular.AnchorTabularExplainer(
                 class_names=class_names,
                 feature_names=feature_names,
-                train_data=X_np,
+                train_data=to_positions(X_np),
                 categorical_names=categorical_names
             )
 
@@ -96,7 +112,7 @@ def run_anchors(unified_payload, prepared_inputs, output_dir=None, df=None):
             np.random.seed(unified_payload["metadata"]["random_state"])
 
             exp = explainer.explain_instance(
-                data_row=x_1d,
+                data_row=to_positions(np.asarray(x_1d).reshape(1, -1))[0],
                 classifier_fn=predict_fn,
                 threshold=0.95,
                 verbose=True
