@@ -18,6 +18,15 @@ def extract_metadata(
     if not features_list:
         raise ValueError("The dataset must contain at least one feature column.")
 
+    # The XAI methods cannot handle missing values
+    missing = df[features_list].isna().sum()
+    missing = missing[missing > 0]
+    if not missing.empty:
+        raise ValueError(
+            "The dataset has missing values (NaN) in feature columns "
+            f"{dict(missing)} (column: number of rows). Fill or drop them first."
+        )
+
     # Categorical features: text / "category" columns are found automatically,
     # number columns that hold category codes are added by the user
     categorical_number_features = list(categorical_number_features or [])
@@ -81,7 +90,8 @@ def build_unified_payload(
     class_names=None,
     features_to_plot=None,
     random_state=42,
-    feature_metadata=None
+    feature_metadata=None,
+    target_known=None
 ):
     """Build the unified payload used by the XAI methods."""
 
@@ -94,6 +104,13 @@ def build_unified_payload(
     )
 
     features_list = metadata_info["features_list"]
+
+    if features_to_plot is not None:
+        unknown = [f for f in features_to_plot if f not in features_list]
+        if unknown:
+            raise ValueError(
+                f"features_to_plot {unknown} are not features of the dataset."
+            )
     resolved_active_target = metadata_info["resolved_active_target"]
 
     # Validate the query instance index
@@ -114,6 +131,9 @@ def build_unified_payload(
         "full_dataset": df,
         "reference_dataset": df[features_list],
         "target": df[resolved_active_target],
+        # True where the target value is a true one, not a filled-in
+        # prediction (None: every value is true). Used by PFI.
+        "target_known": None if target_known is None else target_known[resolved_active_target],
         "query_instance": df[features_list].iloc[[query_index]],
         "scope": scope,
         "metadata": {

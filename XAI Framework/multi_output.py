@@ -262,14 +262,10 @@ def check_output_count(model, query_df, targets):
     out = np.asarray(model.predict(query_df))
     n_outputs = 1 if out.ndim == 1 else out.shape[1]
 
-    if len(targets) == 1 and n_outputs > 1:
-        raise ValueError(
-            f"The model predicts {n_outputs} outputs per row, but only one target "
-            f"column was given ({targets[0]!r}). Pass all {n_outputs} target "
-            f"columns, e.g. --target y1 y2 ..."
-        )
-    if len(targets) > 1 and n_outputs != len(targets):
+    if n_outputs != len(targets):
         raise ValueError(
             f"{len(targets)} target columns were given {targets}, but the model "
-            f"predicts {n_outputs} output(s) per row."
+            f"predicts {n_outputs} output(s) per row. "
+            f"Check the given target columns to match the "
+            f"{n_outputs} output(s)."
         )

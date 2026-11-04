@@ -36,10 +36,10 @@ def load_dataset(dataset_path, target_col):
             f"Available columns: {list(data.columns)}"
         )
 
-    if data[targets].isna().any().any():
-        raise ValueError(
-            f"Target column(s) contain missing values: {targets}"
-        )
+    # Empty target values are allowed: rows without a true value yet (e.g. a
+    # forecast for tomorrow) get the model's prediction later, in
+    # framework_adapter.fill_unknown_targets(). The column itself must exist,
+    # so that a typo in --target is still caught.
 
     X = data.drop(columns=targets)
     y = data[targets[0]] if len(targets) == 1 else data[targets]

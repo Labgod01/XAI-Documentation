@@ -1,13 +1,15 @@
 from pathlib import Path
 import json
 import shutil
+import sys
+import traceback
 import config
 import argparse
 import matplotlib.pyplot as plt
 from demo_models import create_demo
 from data_loader import load_inputs
 from pipeline import build_unified_payload
-from framework_adapter import prepare_xai_inputs
+from framework_adapter import fill_unknown_targets, prepare_xai_inputs
 from multi_output import as_target_list
 from xai_methods.lime import run_lime
 from xai_methods.tree_shap import run_tree_shap
@@ -19,7 +21,7 @@ from xai_methods.pfi import run_pfi
 from xai_methods.pdp_ice import run_pdp_ice
 from xai_methods.ig import run_ig
 
-# key -> (label, module, function, needs_df). The dict order is the run order.
+# key -> (label, function, needs_df). The dict order is the run order.
 # The keys are the same names used in config.xai_methods.
 
 METHODS = {
@@ -184,6 +186,9 @@ def main():
     targets = as_target_list(target_col)
     results = {}
 
+    # Rows without a true target value get the model's prediction
+    df, target_known = fill_unknown_targets(model, df, targets, task_type)
+
     save_feature_metadata(config.feature_metadata, df, targets, output_dir)
     check_class_to_explain(args.class_to_explain, targets, task_type)
 
@@ -207,6 +212,7 @@ def main():
             features_to_plot=config.features_to_plot,
             random_state=args.random_state,
             feature_metadata=config.feature_metadata,
+            target_known=target_known,
         )
         prepared.append((active_target, payload, prepare_xai_inputs(payload)))
 
@@ -217,6 +223,7 @@ def main():
             f"class_to_explain={args.class_to_explain!r} is not a class of any target."
         )
 
+    failures = []
     for active_target, payload, prepared_inputs in prepared:
 
         # 4. Run Methods
@@ -244,7 +251,15 @@ def main():
                 kwargs["df"] = df
 
             plt.close("all")
-            results[active_target][key] = run_method(**kwargs)
+            # A failing method is reported, and the other methods still run
+            try:
+                results[active_target][key] = run_method(**kwargs)
+            except Exception as exc:
+                traceback.print_exc()
+                print(f"\n[ERROR] {label} failed for target '{active_target}': "
+                      f"{type(exc).__name__}: {exc}")
+                failures.append((active_target, label, f"{type(exc).__name__}: {exc}"))
+                results[active_target][key] = None
 
     print("\nFramework execution completed.")
     print(f"Results directory: {output_dir.resolve()}")
@@ -253,8 +268,15 @@ def main():
         if len(targets) > 1:
             print(f"\nTarget: {active_target}")
         for key in selected:
-            print(f"{METHODS[key][0]} explanations returned: "
-                  f"{len(results[active_target][key])}")
+            result = results[active_target][key]
+            status = "FAILED" if result is None else len(result)
+            print(f"{METHODS[key][0]} explanations returned: {status}")
+
+    if failures:
+        print(f"\n{len(failures)} method run(s) failed:")
+        for active_target, label, error in failures:
+            print(f"  {label} [{active_target}]: {error}")
+        sys.exit(1)
 
 def check_class_to_explain(class_to_explain, targets, task_type):
     """A dict class_to_explain may only name target columns."""

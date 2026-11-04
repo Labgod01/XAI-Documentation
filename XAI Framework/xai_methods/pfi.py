@@ -69,11 +69,26 @@ def run_pfi(unified_payload, prepared_inputs, output_dir=None, df=None):
                     else "r2"
                 )
 
+            # PFI measures how much the score drops, so it needs the true
+            # target values: rows that only hold the model's prediction
+            # (see framework_adapter.fill_unknown_targets) are left out
+            known = unified_payload.get("target_known")
+            rows = (pd.Series(True, index=df.index) if known is None
+                    else known.reindex(df.index, fill_value=False))
+            n_rows = int(rows.sum())
+            if n_rows == 0:
+                print(f"PFI: target '{current_target}' has no true values in the "
+                      "dataset, only predictions. Skipping PFI.")
+                continue
+            if n_rows < len(df):
+                print(f"PFI: using the {n_rows} of {len(df)} rows that have a "
+                      f"true value of '{current_target}'.")
+
             # Compute Permutation Feature Importance
             pfi_result = permutation_importance(
                 estimator=model,
-                X=df[feature_names],
-                y=unified_payload["target"].values,
+                X=df.loc[rows, feature_names],
+                y=df.loc[rows, current_target].values,
                 scoring=active_scoring,
                 n_repeats=10,
                 random_state=unified_payload["metadata"]["random_state"],
@@ -98,6 +113,7 @@ def run_pfi(unified_payload, prepared_inputs, output_dir=None, df=None):
                 "task_type": unified_payload["metadata"]["task_type"],
                 "scoring": active_scoring,
                 "n_repeats": 10,
+                "n_rows": n_rows,
                 "features": [
                     {
                         "feature": str(name),
